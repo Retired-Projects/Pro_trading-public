@@ -103,6 +103,188 @@
 
 ---
 
+## 아키텍처
+
+Flutter 앱(Riverpod 상태관리)이 시세 API(네이버/야후/트웰브데이터/코인게코)를 폴링해 화면을 그리고, 사용자 데이터(잔고/보유종목/주문/체결/관심종목/AI리포트)는 Supabase(Postgres + RLS)에 저장한다. AI 리포트 생성과 회원탈퇴는 Supabase Edge Function으로 분리되어 있고, Edge Function은 LLM API 키를 직접 갖지 않고 별도의 **Vault(키 풀 관리) 프로젝트**에서 그때그때 키를 대여(acquire)/반납(release)해 Groq를 호출한다.
+
+```mermaid
+flowchart TB
+    subgraph Client["Flutter App (lib/)"]
+        UI["Screens\n(trading/portfolio/ai_report/...)"]
+        Providers["Riverpod Providers\n(market/portfolio/ai_analysis/...)"]
+        Services["Services\n(polling/trading_engine/supabase_service/ai_analysis_service)"]
+        UI --> Providers --> Services
+    end
+
+    subgraph MarketAPIs["외부 시세 API"]
+        Naver["네이버 금융\n(한국 주식)"]
+        Yahoo["Yahoo Finance\n(미국 주식)"]
+        Twelve["Twelve Data\n(미국 주식 백업)"]
+        CoinGecko["CoinGecko\n(암호화폐)"]
+    end
+
+    subgraph Supabase["Supabase 프로젝트"]
+        Auth["Auth\n(이메일/비밀번호, 익명 로그인)"]
+        DB[("Postgres\nprofiles/holdings/orders/\ntrade_logs/watchlist/ai_reports/app_config")]
+        RLS["RLS 정책\n(auth.uid() = user_id)"]
+        RPC["RPC\nget_leaderboard()"]
+        subgraph Functions["Edge Functions"]
+            Analyze["analyze-investment"]
+            DeleteAcct["delete-account"]
+        end
+    end
+
+    subgraph VaultProj["Vault 프로젝트 (별도 Supabase)"]
+        VaultDB[("key_pool 테이블")]
+        VaultRPC["RPC\nacquire_key_slot / release_key_slot\n/ deactivate_key_model"]
+    end
+
+    Groq["Groq API\n(llama-3.3-70b 등, 폴백 체인)"]
+
+    Services -- "폴링 (3초)" --> MarketAPIs
+    Services -- "Auth / CRUD" --> Auth
+    Services -- "CRUD (anon key)" --> DB
+    DB -.-> RLS
+    Services -- "invoke" --> Analyze
+    Services -- "invoke" --> DeleteAcct
+    Services -- "select" --> RPC
+    Analyze -- "acquire/release 키" --> VaultRPC
+    VaultRPC --> VaultDB
+    Analyze -- "Bearer 대여 키" --> Groq
+    Analyze -- "upsert ai_reports\n(service_role)" --> DB
+    RPC --> DB
+```
+
+**핵심 설계**
+- **키 격리**: Groq API 키는 앱/Edge Function에 저장되지 않는다. `analyze-investment`가 요청마다 Vault RPC로 키를 대여하고, 사용 후 토큰 사용량과 함께 반납한다 → 키 노출 범위 최소화 + 여러 프로젝트가 키 풀을 공유 가능.
+- **최소 권한 노출**: 리더보드는 `get_leaderboard()` SECURITY DEFINER RPC로 닉네임/총자산만 노출, `profiles` 원본 테이블은 RLS로 본인 행만 접근 가능.
+- **서버 검증**: `analyze-investment`는 JWT로 사용자 인증 후 요청 바디 형식·최대 체결건수(1,000건)를 검증해 DoS를 방지한다.
+
+## 키 슬롯 획득/해제 흐름 (`analyze-investment`)
+
+Groq API 429(rate limit) 응답 시 키 슬롯을 비활성화하고 최대 9회까지 다른 슬롯으로 재시도, 그래도 실패하면 모델을 3단계(`llama-3.3-70b-versatile` → `llama-4-scout-17b` → `llama-3.1-8b-instant`)로 폴백한다.
+
+```mermaid
+sequenceDiagram
+    actor U as 사용자 (Flutter 앱)
+    participant EF as analyze-investment (Edge Function)
+    participant V as Vault RPC (acquire/release/deactivate)
+    participant G as Groq API
+    participant DB as Supabase DB (ai_reports)
+
+    U->>EF: POST /analyze-investment\n(JWT, portfolio + trade_logs)
+    EF->>EF: JWT 검증 + 바디 검증\n(최대 1,000건, 최소 3회 거래)
+    EF->>EF: buildPrompt() — 승률/손익비/보유기간 등 통계 계산
+
+    loop 모델 폴백 (최대 3개 모델)
+        loop 슬롯 재시도 (최대 9회)
+            EF->>V: acquire_key_slot(provider="groq", model)
+            V-->>EF: {row_id, key_value}
+            alt 슬롯 없음
+                EF-->>U: 503 서비스 일시 불가
+            end
+            EF->>G: POST /chat/completions (Bearer 대여 키)
+            alt 200 OK
+                G-->>EF: 리포트 텍스트 + 토큰 수
+                EF->>V: release_key_slot(row_id, success=true, tokens)
+                Note over EF,V: 루프 종료 → 결과 사용
+            else 429 Too Many Requests
+                EF->>V: deactivate_key_model(row_id)
+                Note over EF: 다음 슬롯으로 재시도
+            else 기타 오류 / 타임아웃(30s)
+                EF->>V: release_key_slot(row_id, success=false)
+                Note over EF: 다음 모델로 폴백
+            end
+        end
+    end
+
+    EF->>DB: upsert ai_reports\n(user_id, report_date, content, ...)\nonConflict: user_id,report_date
+    EF-->>U: 200 { analysis }
+```
+
+## 데이터 모델
+
+```mermaid
+erDiagram
+    PROFILES ||--o{ HOLDINGS : "user_id"
+    PROFILES ||--o{ ORDERS : "user_id"
+    PROFILES ||--o{ TRADE_LOGS : "user_id"
+    PROFILES ||--o{ WATCHLIST : "user_id"
+    PROFILES ||--o{ AI_REPORTS : "user_id"
+    ORDERS ||--o{ TRADE_LOGS : "order_id"
+
+    PROFILES {
+        uuid user_id PK
+        text nickname
+        double balance
+        double total_asset
+        timestamptz last_login_at
+        timestamptz updated_at
+    }
+    HOLDINGS {
+        uuid user_id FK
+        text stock_code
+        text stock_name
+        numeric quantity "numeric(18,8)"
+        double avg_price
+        timestamptz updated_at
+    }
+    ORDERS {
+        uuid id PK
+        uuid user_id FK
+        text stock_code
+        text type "market/limit/stopLoss/takeProfit"
+        text side "buy/sell"
+        double price
+        numeric quantity "numeric(18,8)"
+        numeric filled_quantity
+        text status "pending/filled/partiallyFilled/cancelled"
+        timestamptz created_at
+        timestamptz filled_at
+    }
+    TRADE_LOGS {
+        uuid id PK
+        uuid user_id FK
+        uuid order_id FK
+        text stock_code
+        text side "buy/sell"
+        double price
+        numeric quantity "numeric(18,8)"
+        double fee
+        double tax
+        timestamptz executed_at
+    }
+    WATCHLIST {
+        uuid id PK
+        uuid user_id FK
+        text stock_code
+        text stock_name
+        text market "KR/US/CRYPTO 등"
+        timestamptz created_at
+    }
+    AI_REPORTS {
+        uuid id PK
+        uuid user_id FK
+        date report_date
+        text content
+        int trade_count
+        double total_asset
+        double total_return
+        timestamptz created_at
+    }
+    APP_CONFIG {
+        bigint id PK "always 1"
+        text min_version
+        text store_url_android
+        text store_url_ios
+        timestamptz updated_at
+    }
+```
+
+`holdings`는 `(user_id, stock_code)` 유니크 제약(upsert 기반), `ai_reports`는 `(user_id, report_date)` 유니크 제약(하루 1회 upsert), `watchlist`는 `(user_id, stock_code)` 유니크 제약. `app_config`는 `id=1` 단일 행만 허용(`CHECK` 제약)되는 전역 설정 테이블로 사용자와 무관하다.
+
+---
+
 ## 프로젝트 구조
 
 ```
