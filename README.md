@@ -379,8 +379,8 @@ supabase/
 ### 설치 및 실행
 
 ```bash
-git clone https://github.com/kimdzhekhon/Pro_trading.git
-cd Pro_trading
+git clone https://github.com/Retired-Projects/Pro_trading-public.git
+cd Pro_trading-public
 flutter pub get
 flutter run
 ```
@@ -401,7 +401,8 @@ flutter build apk --release
 ### Supabase 설정 (직접 배포 시)
 
 1. [Supabase](https://supabase.com)에서 프로젝트 생성
-2. SQL Editor에서 `supabase/migrations/` 내 파일을 순서대로 실행
+2. SQL Editor에서 루트의 `supabase_schema.sql`(전체 스키마)을 먼저 실행한 뒤, `supabase/migrations/` 내 파일을 순서대로 실행
+   - `supabase/migrations/20260415052253_remote_commit.sql`은 빈 파일입니다(원격 초기 스냅샷 커밋 흔적) — 실제 스키마는 `supabase_schema.sql`에 있습니다.
 3. Authentication → Settings → **Anonymous sign-ins** 활성화
 4. `lib/core/config/supabase_config.dart`에 URL과 anon key 입력
 5. Edge Functions 배포:
@@ -411,6 +412,7 @@ flutter build apk --release
    ```
 6. Edge Function 환경변수 설정:
    - `SUPABASE_SERVICE_ROLE_KEY` — 리포트 서버 저장용
+   - `VAULT_URL`, `VAULT_SERVICE_KEY` — `analyze-investment`의 AI 리포트 생성 기능은 별도로 운영하는 비공개 Vault 서비스(여러 프로젝트가 공유하는 LLM API 키 풀)에 의존합니다. 이 저장소에는 Vault 서비스 자체가 포함돼 있지 않으므로, 값을 설정하지 않으면 `vaultAcquire`가 조용히 null을 반환하며 AI 리포트 기능만 비활성화됩니다(나머지 기능은 정상 동작).
 
 ---
 
